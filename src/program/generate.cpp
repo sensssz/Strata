@@ -74,6 +74,7 @@
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
 #include "strata/program/draft_kv_plan.hpp"
+#include "strata/program/mtp_lend.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -587,6 +588,7 @@ struct Options {
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    bool mtp_lend = false;       ///< --mtp-lend / STRATA_MTP_LEND=1 (opt-in): the draft layer's experts lent to the prompt path
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
@@ -833,6 +835,8 @@ void usage() {
                  "                       (default) or one per stream (llama.cpp's MTP graph)\n"
                  "  --mtp-q4 all|proj|head  opt-in: the draft layer's projections and/or draft head as 4-bit copies\n"
                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
+                 "  --mtp-lend           opt-in (one GPU): the draft layer's 512 experts (675 MiB) are the expert cache's tail,\n"
+                 "                       lent to the prompt path with its last slots and copied back after each prompt\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -2088,6 +2092,8 @@ int main(int argc, char** argv) {
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+        else if (a == "--mtp-lend") o.mtp_lend = true;
+        else if (a == "--no-mtp-lend") o.mtp_lend = false;
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
@@ -4605,6 +4611,7 @@ int main(int argc, char** argv) {
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
+    strata::program::mtp_lend::State mtpl;   // --mtp-lend (strata/program/mtp_lend.hpp)
     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
@@ -4626,8 +4633,16 @@ int main(int argc, char** argv) {
         // the next window's drafts), and the round/step graphs carry the forcing kernel
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
+        strata::program::mtp_lend::before_load(mtpl, mtp, {.asked = strata::program::mtp_lend::asked(o.mtp_lend, std::getenv("STRATA_MTP_LEND")),
+                                        .drafter = !o.mtp.empty(), .multi_gpu = multi_gpu, .batch_mtp = batch_mtp,
+                                        .pipeline = o.pipeline_windows >= 2, .vram_elastic = o.vram_elastic,
+                                        .cache_vmm = strata::core::ExpertCache::vmm_enabled(),
+                                        .helper_caches = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                                                     [](int r) { return r > 0; }),
+                                        .no_borrow = o.no_prefill_borrow, .integrated = strata::program::mtp_lend::device_integrated()});
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
+        if (!strata::program::mtp_lend::after_load(mtpl, mtp, err)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
             // LAST stage's slot-b session (bslot_ss.back(): stage 0's on one GPU): it borrows that session's context
@@ -5373,6 +5388,7 @@ int main(int argc, char** argv) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
+                strata::program::mtp_lend::before_cache_open(mtpl, xcache, mtp);   // --mtp-lend: the drafter's experts as the tail
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
@@ -6007,6 +6023,7 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
+    if (!strata::program::mtp_lend::attach(mtpl, mtp, xcache, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
@@ -6547,6 +6564,7 @@ int main(int argc, char** argv) {
     // bytes -> slots for CUDA0's cache: exact when it knows its per-slot offsets (a native pack's blobs differ
     // per layer), otherwise max_blob each.
     auto slots_from_bytes = [&](uint64_t need) -> int64_t {
+        if (xcache.tail_bytes() > 0) return strata::program::mtp_lend::slots_for_need(xcache, need, strata::kernels::cpu::expert_layout().max_blob);   // --mtp-lend
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
@@ -6560,6 +6578,7 @@ int main(int argc, char** argv) {
     // caller's lend budget is `min(slots - 128, pct * slots / 100)` and goes negative on a cache smaller than 128
     // slots, where `slots - k` would index slot_offsets() past its end.  Such a cache lends nothing, so say so.
     auto bytes_from_slots = [&](int64_t k) -> uint64_t {
+        if (xcache.tail_bytes() > 0) return strata::program::mtp_lend::bytes_of_last(xcache, k);   // --mtp-lend: the tail too
         if (k <= 0) return 0;
         if (xcache.slot_offsets() != nullptr)
             return (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]);
@@ -7314,6 +7333,7 @@ int main(int argc, char** argv) {
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
         auto cache_slots_for = [&](const strata::core::ExpertCache& xc, uint64_t need) -> int64_t {
+            if (xc.tail_bytes() > 0) return strata::program::mtp_lend::slots_for_need(xc, need, strata::kernels::cpu::expert_layout().max_blob);   // --mtp-lend
             return strata::program::split_lend_slots(xc.slots(), xc.bytes(), xc.slot_offsets(),
                                                      (uint64_t) strata::kernels::cpu::expert_layout().max_blob, need);
         };
@@ -7321,6 +7341,7 @@ int main(int argc, char** argv) {
             return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr));
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
+            if (p.cache->tail_bytes() > 0) return p.cache->lendable_bytes_from(first);   // --mtp-lend: the tail too
             strata::core::ExpertCache& xc = *p.cache;
             return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
                                      : (uint64_t) (xc.slots() - first) *
@@ -11458,6 +11479,7 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
             static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
             auto refill = [&](std::string& e) -> bool {
+                if (!strata::program::mtp_lend::refill(mtpl, mtp, e)) return false;   // --mtp-lend: the draft layer's experts back first
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
@@ -11484,6 +11506,7 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
+                if (!pf_parts.empty() && pf_parts[0].first >= 0 && !strata::program::mtp_lend::lend(mtpl, mtp, e)) return false;   // --mtp-lend
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -13208,6 +13231,7 @@ int main(int argc, char** argv) {
                 borrow = xcache.device_slot(first);
                 borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
                                                      : (uint64_t) k * (uint64_t) blob;
+                if (!strata::program::mtp_lend::lend_oneshot(mtpl, mtp, xcache, first, borrow_bytes, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                 std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
                              (double) borrow_bytes / 1073741824.0);
             }
@@ -13270,6 +13294,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
         }
+        if (!strata::program::mtp_lend::refill(mtpl, mtp, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
         pos_start = n_batched;

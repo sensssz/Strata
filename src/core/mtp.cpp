@@ -153,6 +153,8 @@ MtpDrafter::~MtpDrafter() {
     if (sh_fork_) cudaEventDestroy(sh_fork_);
     if (sh_join_) cudaEventDestroy(sh_join_);
     if (owns_weights_ && dense_) cudaFree(dense_);
+    if (experts_borrowed_) experts_ = nullptr;   // --mtp-lend: the expert cache's tail, freed with the cache
+    if (h_experts_) cudaFreeHost(h_experts_);
     if (owns_weights_ && experts_) cudaFree(experts_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
@@ -305,8 +307,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
+    // ---- --mtp-lend: the experts to a pinned host copy instead (attach_experts puts them on the device later)
+    if (shared == nullptr && defer_experts_ && !load_experts_host(rt_dir, g, err)) return false;
     // ---- the 512 routed experts, one blob each
-    if (shared == nullptr) {
+    if (shared == nullptr && !defer_experts_) {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
@@ -1530,6 +1534,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
 #endif
     const OnDevice on_device(device_);
+    if (!experts_resident_) { err = "mtp: the draft layer's experts are lent to the prompt path (--mtp-lend)"; return false; }
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
@@ -1733,6 +1738,7 @@ bool MtpDrafter::prepare_chain(std::string& err) {
 bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
                               int n_out, int n_early, std::string& err) {
     const OnDevice on_device(device_);
+    if (!experts_resident_) { err = "mtp: the draft layer's experts are lent to the prompt path (--mtp-lend)"; return false; }
     if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
     if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > max_t_ - 1 || n_force < 0 || n_force > n_out ||
@@ -1835,3 +1841,5 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
 }
 
 }  // namespace strata::core
+
+#include "mtp_lend.inl"   // --mtp-lend (opt-in): the experts lent to the prompt path

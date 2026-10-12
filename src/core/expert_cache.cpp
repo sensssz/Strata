@@ -467,6 +467,7 @@ bool g_cache_vmm = false;   // set_vmm
 }  // namespace
 
 void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
+bool ExpertCache::vmm_enabled() { return g_cache_vmm; }
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
@@ -480,7 +481,15 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+    const uint64_t want_slots = (uint64_t) n_slots * (uint64_t) blob_bytes;
+    // --mtp-lend: the tail after the slots, in the same allocation, so a loan over the last slots and the tail is one
+    // contiguous range (Prefill lays its buffers out in one region)
+    const uint64_t tail_off = tail_req_ > 0 ? (want_slots + 255) / 256 * 256 : want_slots;
+    const uint64_t want = tail_off + tail_req_;
+    if (tail_req_ > 0 && (seg_req_ > 0 || g_cache_vmm)) {
+        err = "ExpertCache: the MTP tail (--mtp-lend) needs one plain allocation, not segments or a VMM range";
+        return false;
+    }
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
@@ -540,6 +549,8 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
+    tail_off_ = tail_req_ > 0 ? tail_off : 0;   // --mtp-lend
+    tail_bytes_ = tail_req_;
 #if defined(STRATA_USE_HIP)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
@@ -600,6 +611,8 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
+    tail_off_ = 0;   // --mtp-lend (tail_req_ stays: a reopen makes the tail again)
+    tail_bytes_ = 0;
     if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {

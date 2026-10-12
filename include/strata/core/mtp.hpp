@@ -66,6 +66,25 @@ public:
     /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
     /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
+    /// --mtp-lend (opt-in; before load): load() reads the 512 routed experts into a pinned host copy instead of VRAM,
+    /// and attach_experts() later points the layer at a device block - the expert cache's tail, which the prompt path's
+    /// loan covers.  Only a draft round reads the experts (the prompt pass is K/V only, dense weights), so they are lent
+    /// while a prompt is read and copied back before the next draft.  No pinned RAM: load() keeps them in VRAM as before.
+    void set_defer_experts(bool on) { defer_experts_ = on; }
+    bool defer_experts() const { return defer_experts_; }
+    /// The routed experts' bytes (n_expert x BLOB; after load).
+    uint64_t expert_bytes() const;
+    /// --mtp-lend: the experts' device block (`expert_bytes()` long, on this drafter's device; null: a cudaMalloc of its
+    /// own, as without --mtp-lend), uploaded from the host copy and read back.  Before bind() and any capture: the round
+    /// and step graphs hold the address.  A no-op unless load() deferred the experts.
+    bool attach_experts(uint8_t* dev, std::string& err);
+    /// --mtp-lend: false from lend_experts() (the prompt path overwrites the block) to restore_experts() (copied back).
+    bool experts_resident() const { return experts_resident_; }
+    bool experts_lendable() const { return experts_borrowed_; }
+    /// --mtp-lend: waits for this drafter's stream and marks the experts lent (refused with a chain in flight).
+    bool lend_experts(std::string& err);
+    /// --mtp-lend: copies the host copy back into the block (blocking) and marks the experts resident.
+    bool restore_experts(std::string& err);
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
@@ -242,6 +261,12 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    // --mtp-lend (src/core/mtp_lend.inl)
+    bool load_experts_host(const std::string& rt_dir, const ModelGeometry& g, std::string& err);
+    bool defer_experts_ = false;
+    bool experts_resident_ = true;    ///< false between lend_experts() and restore_experts()
+    bool experts_borrowed_ = false;   ///< experts_ is the expert cache's tail: never freed here
+    uint8_t* h_experts_ = nullptr;    ///< the pinned host copy
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;

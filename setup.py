@@ -69,6 +69,7 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
+    "KilltheSniper/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "42c3ea8fb145c624ffb53e12b0b80567ff464282",
 }
 
 
@@ -243,14 +244,15 @@ NVFP4_ENGINE = (0, 1, 44)
 MODELS = {
     # the original model only for now: Swift 1.5's Q2_0 files split one layer's experts across the two shards, which
     # the pack tool (tools/iq_pack.py) cannot prepare yet (#171)
-    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0, "families": ("qwen",)},
+    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0, "families": ("qwen", "abliterated")},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
-               "arena_gb": 35.5},
+               "arena_gb": 35.5, "families": ("qwen", "swift", "abliterated")},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "abliterated")},
     # matches the full BF16 model on the published benchmarks; Swift 1.5 got an IQ3_S tier of its own (#1651)
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "abliterated")},
     # the Coder release: 256 of the 512 experts kept (the ones code, tools and vision use), IQ2_S-IQ4_XS like IQ3_S
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
@@ -421,6 +423,13 @@ FAMILIES = {
               "tag": "nvfp4-", "name": "qwen3.8-flash-next-nvfp4", "ready": True,
               "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
               "mmproj_sha256": (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0")},
+    "abliterated": {"title": "Qwen3.8-Flash-Next (abliterated)", "by": "SC117's refusal-removed transplant of the official GSQ-RCO",
+                    "about": "the official GSQ-RCO quant with 144 refusal-direction tensors replaced (uncensored); "
+                             "same speed and RAM as the official model",
+                    "hf": hf("KilltheSniper/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF") + "{q}/",
+                    "file": "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf", "tag": "abliterated-",
+                    "mmproj_hf": hf("KilltheSniper/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"),
+                    "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-abliterated"},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -1655,6 +1664,13 @@ def download(url, dst: Path, what=None):
         ok(f"{what or dst.name} already downloaded")
         return
     have = part.stat().st_size if part.exists() else 0
+    # optional bandwidth cap: STRATA_DL_MIBPS=<MiB/s> (e.g. 20) throttles the download so it does not starve
+    # other network traffic; unset = full speed
+    _cap = 0.0
+    try:
+        _cap = float(os.environ.get("STRATA_DL_MIBPS", "0") or 0)
+    except ValueError:
+        pass
     for attempt in range(30):
         if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
             break                                      # ask for (a range past the end is a 416, retried 30 times)
@@ -1672,6 +1688,8 @@ def download(url, dst: Path, what=None):
                         break
                     f.write(b)
                     have += len(b)
+                    if _cap > 0 and b:
+                        time.sleep(len(b) / (_cap * 1048576))
                     if time.time() - last > 2:
                         last = time.time()
                         size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total \
