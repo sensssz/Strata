@@ -136,6 +136,24 @@ public:
     bool grow(int64_t want_bytes, std::string& err);
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;
+
+    /// --mtp-lend (opt-in): `bytes` of device memory right after the last slot, in the same allocation (a 256-byte
+    /// aligned start), for a block the caller owns - the MTP draft layer's routed experts.  The prompt path's loan may
+    /// cover it together with the cache's last slots; `slots()`, `bytes()` and the residency table never include it.
+    /// Applies to the next open/open_sized; 0 (the default) = none.  Refused with segments (--vram-elastic) or the
+    /// elastic K/V's VMM range.
+    void set_tail_bytes(uint64_t bytes) { tail_req_ = bytes; }
+    uint8_t* tail() { return tail_bytes_ ? base_ + tail_off_ : nullptr; }
+    uint64_t tail_bytes() const { return tail_bytes_; }
+    /// Bytes from slot `first`'s start to the end of the allocation, the tail included: what a loan starting at `first`
+    /// may lay its buffers out over.  first == slots(): the tail alone (and its alignment pad).
+    uint64_t lendable_bytes_from(int64_t first) const {
+        first = first < 0 ? 0 : first > live_slots_ ? live_slots_ : first;
+        const uint64_t end = tail_bytes_ ? tail_off_ + tail_bytes_ : (uint64_t) slot_end(live_slots_);
+        return end - slot_offset(first);
+    }
+    /// Whether the next open maps the arena in a VMM range (set_vmm: the elastic K/V).
+    static bool vmm_enabled();
     /// The bytes the first `n` slots span.
     int64_t bytes_of(int64_t n) const { return slot_end(n < 0 ? 0 : n > slots_ ? slots_ : n); }
 
@@ -246,6 +264,9 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    uint64_t tail_req_ = 0;             ///< --mtp-lend: the tail asked for (set_tail_bytes)
+    uint64_t tail_off_ = 0;             ///< --mtp-lend: the tail's offset in the arena
+    uint64_t tail_bytes_ = 0;           ///< --mtp-lend: the tail made by the last open (0: none)
 };
 
 }  // namespace strata::core
