@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #include "strata/core/emulate.hpp"
+#include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +9,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -458,6 +460,19 @@ bool sel_gfx12_device() {
     }
     return ok[dev] == 1;
 }
+
+// RDNA2 (gfx1030-gfx1036): the FP32 tiled scorer's tiling measured there
+bool sel_gfx103_device() {
+    static int ok[64] = {};   // per device: 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (ok[dev] == 0) {
+        cudaDeviceProp prop;
+        ok[dev] = (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) ? 1 : 2;
+        cudaGetLastError();
+    }
+    return ok[dev] == 1;
+}
 #endif  // __HIPCC__
 
 // the tail block n_bid of each query: exactly block_scores_kernel's arithmetic for that block
@@ -487,51 +502,61 @@ __global__ void __launch_bounds__(32) block_scores_tail_kernel(const float* __re
     }
 }
 
-// ---- the block scores as an FP32 tiled GEMM for CUDA cards without TF32 tensor cores (below sm_80): rows (query,
-// indexer head) x columns (blocks), K = 128 through shared memory, 2 queries x 4 heads x 4 blocks per thread, relu per
-// head summed in registers.  The warp kernel spends 5 shuffles per 4 products and reached ~1 TFLOPS on an RTX 2080
-// Ti; this one ~6.9 (256 queries: 4.5x at 4K, 6.8x at 120K-250K).  FP32 like the warp kernel in another summation
-// order, so not bitwise (as the tensor-core scorer).  Blocks < n_bid only; the tail block is block_scores_tail_kernel's.
-constexpr int SM_QT = 32, SM_NB = 64, SM_KC = 32, SM_QS = SM_QT * IDX_HEADS + 4, SM_KS = SM_NB + 4;
+// ---- the block scores as an FP32 tiled GEMM for cards without a matrix-core scorer (CUDA below sm_80; HIP, opt-in):
+// rows (query, indexer head) x columns (blocks), K = 128 through shared memory, 2 queries x 4 heads x TN blocks per
+// thread, relu per head summed in registers.  The warp kernel spends 5 shuffles per 4 products and reached ~1 TFLOPS
+// on an RTX 2080 Ti; this one ~6.9 (256 queries: 4.5x at 4K, 6.8x at 120K-250K).  FP32 like the warp kernel in another
+// summation order, so not bitwise (as the tensor-core scorer).  Blocks < n_bid only; the tail block is
+// block_scores_tail_kernel's.
+//
+// The tiling (QT queries and NB blocks per CTA, KC of K per shared-memory pass, TN blocks per thread) only decides
+// which thread computes which score: every score is still the fmaf chain over k = 0..127 in order and the same relu sum
+// over the heads, so every tiling gives the same bytes (an RX 6900 XT, qsa_select_bench at 32K and 128K, 14 tilings,
+// also with 60 and 72 of its 80 CUs: all byte-identical).  CUDA keeps the tiling it was written with (32/64/32/4);
+// gfx103x runs 32/128/16/8, 15% faster there at 128K (0.695 -> 0.587 ms per 256 queries).
+template <int QT, int NB, int KC, int TN>
 __global__ void __launch_bounds__(256) block_scores_simt_kernel(const float* __restrict__ pooled,
                                                                 const float* __restrict__ q_idx,
                                                                 const int32_t* __restrict__ steps, int64_t nq,
                                                                 int64_t max_blocks, int64_t reach,
                                                                 float* __restrict__ out) {
-    __shared__ __align__(16) float Qs[SM_KC][SM_QS];
-    __shared__ __align__(16) float Ks[SM_KC][SM_KS];
-    const int64_t q0 = (int64_t) blockIdx.y * SM_QT, b0 = (int64_t) blockIdx.x * SM_NB;
-    const int64_t qlast = (q0 + SM_QT < nq ? q0 + SM_QT : nq) - 1;
+    constexpr int ROWS = QT * IDX_HEADS, QS = ROWS + 4, KS = NB + 4, CX = NB / TN;
+    static_assert((ROWS / 8) * CX == 256, "256 threads, 8 rows (2 queries x 4 heads) each");
+    static_assert(TN % 4 == 0 && KC % 4 == 0 && IDX_DIM % KC == 0, "float4 loads");
+    __shared__ __align__(16) float Qs[KC][QS];
+    __shared__ __align__(16) float Ks[KC][KS];
+    const int64_t q0 = (int64_t) blockIdx.y * QT, b0 = (int64_t) blockIdx.x * NB;
+    const int64_t qlast = (q0 + QT < nq ? q0 + QT : nq) - 1;
     if (b0 >= steps[qlast * kStepCount + kStepNBid]) return;   // n_bid rises with the position
-    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
-    float acc[8][4] = {};
-    for (int kc = 0; kc < IDX_DIM; kc += SM_KC) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {   // the query rows: 128 x 8 float4
-            const int idx = tid + i * 256, r = idx >> 3, k4 = idx & 7;
+    const int tid = threadIdx.x, tx = tid % CX, ty = tid / CX;
+    float acc[8][TN] = {};
+    for (int kc = 0; kc < IDX_DIM; kc += KC) {
+        for (int idx = tid; idx < ROWS * (KC / 4); idx += 256) {   // the query rows: ROWS x KC/4 float4
+            const int r = idx / (KC / 4), k4 = idx % (KC / 4);
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             if (q0 + (r >> 2) < nq)
                 v = *reinterpret_cast<const float4*>(q_idx + (q0 * IDX_HEADS + r) * IDX_DIM + kc + k4 * 4);
             Qs[k4 * 4 + 0][r] = v.x; Qs[k4 * 4 + 1][r] = v.y; Qs[k4 * 4 + 2][r] = v.z; Qs[k4 * 4 + 3][r] = v.w;
         }
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {   // the pooled keys: 64 x 8 float4
-            const int idx = tid + i * 256, c = idx >> 3, k4 = idx & 7;
+        for (int idx = tid; idx < NB * (KC / 4); idx += 256) {   // the pooled keys: NB x KC/4 float4
+            const int c = idx / (KC / 4), k4 = idx % (KC / 4);
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             if (b0 + c < reach) v = *reinterpret_cast<const float4*>(pooled + (b0 + c) * IDX_DIM + kc + k4 * 4);
             Ks[k4 * 4 + 0][c] = v.x; Ks[k4 * 4 + 1][c] = v.y; Ks[k4 * 4 + 2][c] = v.z; Ks[k4 * 4 + 3][c] = v.w;
         }
         __syncthreads();
 #pragma unroll 8
-        for (int k = 0; k < SM_KC; ++k) {
-            const float4 qa = *reinterpret_cast<const float4*>(&Qs[k][ty * 8]);
-            const float4 qb = *reinterpret_cast<const float4*>(&Qs[k][ty * 8 + 4]);
-            const float4 kv = *reinterpret_cast<const float4*>(&Ks[k][tx * 4]);
-            const float qr[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w}, kr[4] = {kv.x, kv.y, kv.z, kv.w};
+        for (int k = 0; k < KC; ++k) {
+            float qr[8], kr[TN];
+            *reinterpret_cast<float4*>(&qr[0]) = *reinterpret_cast<const float4*>(&Qs[k][ty * 8]);
+            *reinterpret_cast<float4*>(&qr[4]) = *reinterpret_cast<const float4*>(&Qs[k][ty * 8 + 4]);
+#pragma unroll
+            for (int t = 0; t < TN; t += 4)
+                *reinterpret_cast<float4*>(&kr[t]) = *reinterpret_cast<const float4*>(&Ks[k][tx * TN + t]);
 #pragma unroll
             for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(qr[i], kr[j], acc[i][j]);
+                for (int j = 0; j < TN; ++j) acc[i][j] = fmaf(qr[i], kr[j], acc[i][j]);
         }
         __syncthreads();
     }
@@ -541,8 +566,8 @@ __global__ void __launch_bounds__(256) block_scores_simt_kernel(const float* __r
         if (q >= nq) continue;
         const int64_t n_bid = steps[q * kStepCount + kStepNBid];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int64_t b = b0 + tx * 4 + j;
+        for (int j = 0; j < TN; ++j) {
+            const int64_t b = b0 + tx * TN + j;
             if (b >= n_bid || b >= max_blocks) continue;
             float sc = 0.0f;
 #pragma unroll
@@ -553,6 +578,23 @@ __global__ void __launch_bounds__(256) block_scores_simt_kernel(const float* __r
             out[q * max_blocks + b] = sc;
         }
     }
+}
+
+// The FP32 tiled scores and the tail block; false when the grid does not fit.  `rdna2_tiles`: gfx103x's tiling.
+static bool block_scores_simt(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                              int64_t nq, int64_t max_blocks, int64_t reach, float* scores, cudaStream_t stream,
+                              bool rdna2_tiles) {
+    const int64_t qt = 32, nb = rdna2_tiles ? 128 : 64;
+    const dim3 grid((unsigned) ((reach + nb - 1) / nb), (unsigned) ((nq + qt - 1) / qt));
+    if (grid.y > 65535) return false;
+    if (rdna2_tiles)
+        block_scores_simt_kernel<32, 128, 16, 8><<<grid, 256, 0, stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    else
+        block_scores_simt_kernel<32, 64, 32, 4><<<grid, 256, 0, stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    block_scores_tail_kernel<<<(unsigned) nq, 32, 0, stream>>>(dead, q_idx, steps, max_blocks, scores);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores (simt): %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
 }
 
 // block_scores_simt_kernel with larger tiles (QT queries x NB blocks, RI x CJ products per thread) and the next K
@@ -738,14 +780,29 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
             hist[0][t] = s;
         }
         __syncthreads();
-        if (t == 0) {
-            int cum = above, d = 255;
-            for (; d > 0; --d) {
-                if (cum + hist[0][d] >= width) break;
-                cum += hist[0][d];
+        // the digit: the first bin from the top where the count above reaches `width` (bin 0 when none of 255..1
+        // does).  Threads 0-255 (warps 0-7) prefix-sum the 256 bins in descending order instead of one thread
+        // walking them: the same digit and count above.
+        int v = 0, x = 0;
+        if (t < 256) {
+            v = hist[0][255 - t];
+            x = v;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, x, o);
+                if (lane >= o) x += y;
             }
-            s_digit = d;
-            s_above = cum;
+            if (lane == 31) s_warp[warp] = x;
+        }
+        __syncthreads();
+        if (t < 256) {
+            int inc = x;
+            for (int w2 = 0; w2 < warp; ++w2) inc += s_warp[w2];
+            const int before = above + inc - v;
+            if (before < width && (above + inc >= width || t == 255)) {
+                s_digit = 255 - t;
+                s_above = before;
+            }
         }
         __syncthreads();
         prefix |= (uint32_t) s_digit << shift;
@@ -786,13 +843,14 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
     }
 }
 
-#if !defined(__HIPCC__)
 // ---- a query with more blocks than the register kernel holds (contexts past 4 * 1024 * TK_PER cells): the register
 // kernel's threads, per-warp histograms and warp scans, with each key read from memory again on every pass.  A
 // histogram has no order, so on the four radix passes thread t reads blocks t, t + 1024, ...: a warp reads 32
 // neighbours at a time.  The cells are emitted ascending in the order (warp, row, lane): warp w holds the `per` rows
 // of 32 consecutive blocks from block w * 32 * per.  block_topk_kernel's selection rule (radix threshold, ties to the
 // lowest index): identical ids.
+// campaign3: also compiled on HIP (gfx11: plain shared/atomic code, no sm_90 features; the dispatch still needs
+// reach > fit, i.e. the deep contexts where the ref radix was the only option on AMD).
 constexpr int TS_MAXQ = 4096;
 __device__ int g_tk_fail[TS_MAXQ];   // block_topk_sample_kernel: 1 = the query is block_topk_wide_kernel<true>'s
 template <bool ONLY_FAILED = false>
@@ -907,7 +965,6 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
         run_sel += __shfl_sync(0xffffffffu, ps, 31);
     }
 }
-#endif
 
 
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
@@ -916,12 +973,12 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
 // window, the uncaptured decode, and prefill's pooled16 call.
 constexpr int MQ = 8;
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
-                                                                              const float* __restrict__ dead,
-                                                                              const float* __restrict__ q_idx,
-                                                                              const int32_t* __restrict__ steps, int nq,
-                                                                              int64_t max_blocks, float* __restrict__ out,
-                                                                              bool early_exit) {
+__device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
+                                                        const float* __restrict__ dead,
+                                                        const float* __restrict__ q_idx,
+                                                        const int32_t* __restrict__ steps, int nq, int64_t max_blocks,
+                                                        float* __restrict__ out, bool early_exit,
+                                                        const QsaScoreRows& srow) {
     __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
     __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
     if (!early_exit)
@@ -944,12 +1001,16 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     const int lane = threadIdx.x & 31;
     const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
     for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
-        const float4 kp = *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
-        const float4 kd = *reinterpret_cast<const float4*>(dead + lane * 4);
+        // srow.n > 0: each query reads its own sequence's keys; else one set of keys for every query
+        const bool own = srow.n > 0;
+        const float4 kp = own ? float4{} : *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
+        const float4 kd = own ? float4{} : *reinterpret_cast<const float4*>(dead + lane * 4);
         for (int qi = 0; qi < nq; ++qi) {
             const int64_t n_bid = s_nbid[qi];
             if (b > n_bid) continue;
-            const float4 k4 = (b == n_bid) ? kd : kp;
+            const float4 k4 = !own ? ((b == n_bid) ? kd : kp)
+                            : (b == n_bid) ? *reinterpret_cast<const float4*>(srow.dead[qi] + lane * 4)
+                                           : *reinterpret_cast<const float4*>(srow.pooled[qi] + b * IDX_DIM + lane * 4);
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
             float score = 0.0f;
 #pragma unroll
@@ -967,6 +1028,299 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
         }
     }
 }
+
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
+                                                                              const float* __restrict__ dead,
+                                                                              const float* __restrict__ q_idx,
+                                                                              const int32_t* __restrict__ steps, int nq,
+                                                                              int64_t max_blocks, float* __restrict__ out,
+                                                                              bool early_exit, QsaScoreRows srow = {}) {
+    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
+}
+
+// Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
+// single-query call of block_scores_multi_kernel (qsa_block_scores_slots).
+struct ScoreSlotKeys {
+    const float* pooled[MQ];
+    const float* dead[MQ];
+};
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(ScoreSlotKeys keys,
+                                                                              const float* __restrict__ q_idx,
+                                                                              const int32_t* __restrict__ steps,
+                                                                              int64_t max_blocks, float* __restrict__ out,
+                                                                              bool early_exit) {
+    const unsigned z = blockIdx.y;
+    // the slot's pointers picked by unrolled selects: indexing the argument array by z would copy it to local memory
+    const float* pooled = keys.pooled[0];
+    const float* dead = keys.dead[0];
+#pragma unroll
+    for (unsigned i = 1; i < MQ; ++i)
+        if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
+    block_scores_multi_body(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
+                            steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks, early_exit,
+                            QsaScoreRows{});
+}
+
+// QSAROWS (docs/QSAROWS.md, STRATA_QSA_ROWS=1): block_scores_multi_kernel's work for NQ <= 4 queries with less issue
+// pressure per (block, query).  nsys of a 131k decode window (RTX 2080 Ti + RTX 3060): the multi kernel costs ~20 us more a
+// call for every row of the window on both cards - per (block, query) it reads the four query slices from shared memory
+// (4 x LDS.128) and reduces each head's lane products with its own five shuffles (20 a block and query), and those two
+// pipes bound it, not the key reads (the keys are read once for all the queries, as there).  Here (1) the lane's slices
+// of the NQ queries (4 heads x 4 floats each) live in registers for the whole kernel, (2) the four heads' lane products
+// are reduce-scattered with warp_sum's pairing (xor 16, 8, then 4, 2, 1: six shuffles for the four heads) and gathered
+// to lane 0 in head order (three more).  Every sum adds the same two operands as block_scores_kernel's warp_sum at the
+// same level (float add commutes), the dot expression is the same text in the same file, the relu-and-add runs over the
+// heads in the same order: the same score bits.  The tail block and the +1e9 are as in the multi kernel.
+template <int NQ>
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(const float* __restrict__ pooled,
+                                                                             const float* __restrict__ dead,
+                                                                             const float* __restrict__ q_idx,
+                                                                             const int32_t* __restrict__ steps, int nq,
+                                                                             int64_t max_blocks, float* __restrict__ out) {
+    __shared__ int64_t s_nkv[NQ], s_nbid[NQ];
+    if (threadIdx.x < nq) {
+        s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
+        s_nbid[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNBid];
+    }
+    __syncthreads();
+    int64_t top = 0;
+    for (int q = 0; q < nq; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    if ((int64_t) blockIdx.x * SCORE_WARPS > top) return;   // the multi kernel's early exit (CTA-uniform)
+    const int lane = threadIdx.x & 31;
+    float4 qr[NQ][IDX_HEADS];
+#pragma unroll
+    for (int qi = 0; qi < NQ; ++qi)
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h)
+            qr[qi][h] = qi < nq ? *reinterpret_cast<const float4*>(q_idx + qi * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4)
+                                : make_float4(0.f, 0.f, 0.f, 0.f);
+    const float4 kd = *reinterpret_cast<const float4*>(dead + lane * 4);
+    const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
+    const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
+    for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
+        const float4 kp = *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
+#pragma unroll
+        for (int qi = 0; qi < NQ; ++qi) {
+            if (qi >= nq) break;
+            const int64_t n_bid = s_nbid[qi];
+            if (b > n_bid) continue;
+            const float4 k4 = (b == n_bid) ? kd : kp;
+            float d[IDX_HEADS];
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float4 q4 = qr[qi][h];
+                d[h] = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+            }
+            // reduce-scatter: after xor 16 the lane keeps heads {0,1} (bit 4 clear) or {2,3}; after xor 8 one head
+            float r2[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+                r2[i] = (hi16 ? d[i + 2] : d[i]) + __shfl_xor_sync(0xffffffffu, hi16 ? d[i] : d[i + 2], 16);
+            float r = (hi8 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi8 ? r2[0] : r2[1], 8);
+            r += __shfl_xor_sync(0xffffffffu, r, 4);
+            r += __shfl_xor_sync(0xffffffffu, r, 2);
+            r += __shfl_xor_sync(0xffffffffu, r, 1);
+            // lane 8h holds head h's full sum: gather to lane 0 and add the relus in head order, as the warp kernel
+            const float s1 = __shfl_sync(0xffffffffu, r, 8);
+            const float s2 = __shfl_sync(0xffffffffu, r, 16);
+            const float s3 = __shfl_sync(0xffffffffu, r, 24);
+            if (lane == 0) {
+                float score = 0.0f;
+                score += r > 0.0f ? r : 0.0f;
+                score += s1 > 0.0f ? s1 : 0.0f;
+                score += s2 > 0.0f ? s2 : 0.0f;
+                score += s3 > 0.0f ? s3 : 0.0f;
+                if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
+                out[qi * max_blocks + b] = score;
+            }
+        }
+    }
+}
+
+#if defined(__HIPCC__)
+// Optional gfx1100 port of PR1825 (14bf3215): same FP32 expression and reduction tree.
+// Decode and the original top-k stay unchanged. No additional persistent weight/state allocation.
+constexpr int TS_Q = 64;     // queries per CTA (8 per wave, four lanes per query)
+constexpr int TS_KB = 32;    // key blocks per shared-memory tile
+constexpr int TS_BR = 512;   // key blocks per CTA
+
+__device__ __forceinline__ float ts_part(const float4 k4, const float4 q4) {
+    return k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;   // block_scores_kernel's per-lane expression
+}
+
+__global__ void __launch_bounds__(256, 1) block_scores_thread_kernel(const float* __restrict__ pooled,
+                                                                    const float* __restrict__ q_idx,
+                                                                    const int32_t* __restrict__ steps, int64_t nq,
+                                                                    int64_t max_blocks, int64_t reach,
+                                                                    float* __restrict__ out) {
+    __shared__ __align__(16) float4 ks[TS_KB][IDX_DIM / 4];
+    __shared__ float so[TS_Q][TS_KB + 1];
+    __shared__ int64_t s_nbid[TS_Q];
+    // Four lanes per query, lane j (0..3) one quarter of the tree for all four heads: the partials c[j] of lane 0's
+    // xor-shuffle sum combine groups j, j+16, j+8, j+24, j+4, j+20, j+12, j+28, and only then do the quarters meet
+    // (c0 + c2, c1 + c3, then their sum) - two shuffles here.  A key load now feeds four heads: four times fewer
+    // shared-memory loads per FMA. The MIO-pipe motivation was measured by PR1825 on NVIDIA.
+    constexpr int QG[8] = {0, 16, 8, 24, 4, 20, 12, 28};
+    const int t = threadIdx.x, lane = t & 31;
+    const int ql = (t >> 5) * 8 + (lane >> 2), j4 = lane & 3;   // this lane's query (in the CTA) and quarter
+    const int64_t q0 = (int64_t) blockIdx.y * TS_Q, qi = q0 + ql;
+    if (t < TS_Q) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : -1;
+    float4 qv[IDX_HEADS][8];
+    {
+        const float4* src = reinterpret_cast<const float4*>(q_idx + (qi < nq ? qi : 0) * IDX_HEADS * IDX_DIM);
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h)
+#pragma unroll
+            for (int m = 0; m < 8; ++m) qv[h][m] = src[h * (IDX_DIM / 4) + j4 + QG[m]];
+    }
+    __syncthreads();
+    int64_t top = -1;   // the largest n_bid of the CTA's queries: blocks at or past it are never written here
+    for (int i = 0; i < TS_Q; ++i) top = s_nbid[i] > top ? s_nbid[i] : top;
+    const int64_t b_lo = (int64_t) blockIdx.x * TS_BR;
+    int64_t b_hi = b_lo + TS_BR;
+    if (b_hi > reach) b_hi = reach;
+    if (b_hi > top) b_hi = top;
+    if (b_hi > max_blocks) b_hi = max_blocks;
+    for (int64_t b0 = b_lo; b0 < b_hi; b0 += TS_KB) {
+        const int nb = (int) (b_hi - b0 < TS_KB ? b_hi - b0 : TS_KB);
+        __syncthreads();   // the previous tile's reads of ks and so are done
+        for (int i = t; i < nb * (IDX_DIM / 4); i += blockDim.x)
+            ks[i / (IDX_DIM / 4)][i % (IDX_DIM / 4)] = reinterpret_cast<const float4*>(pooled + (b0 + i / (IDX_DIM / 4)) * IDX_DIM)[i % (IDX_DIM / 4)];
+        __syncthreads();
+        for (int j = 0; j < nb; ++j) {
+            float4 kk[8];
+#pragma unroll
+            for (int m = 0; m < 8; ++m) kk[m] = ks[j][j4 + QG[m]];
+            float e[IDX_HEADS];
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float c = ((ts_part(kk[0], qv[h][0]) + ts_part(kk[1], qv[h][1])) +
+                                 (ts_part(kk[2], qv[h][2]) + ts_part(kk[3], qv[h][3]))) +
+                                ((ts_part(kk[4], qv[h][4]) + ts_part(kk[5], qv[h][5])) +
+                                 (ts_part(kk[6], qv[h][6]) + ts_part(kk[7], qv[h][7])));
+                const float d = c + __shfl_xor_sync(0xffffffffu, c, 2);   // lane 0: c0 + c2, lane 1: c1 + c3
+                e[h] = d + __shfl_xor_sync(0xffffffffu, d, 1);           // lane 0: (c0 + c2) + (c1 + c3)
+            }
+            if (j4 == 0) {
+                float score = 0.0f;
+#pragma unroll
+                for (int h = 0; h < IDX_HEADS; ++h) score += e[h] > 0.0f ? e[h] : 0.0f;
+                so[ql][j] = score;
+            }
+        }
+        __syncthreads();
+        for (int i = t; i < TS_Q * nb; i += blockDim.x) {
+            const int q = i / nb, j = i % nb;
+            if (b0 + j < s_nbid[q]) out[(q0 + q) * max_blocks + b0 + j] = so[q][j];
+        }
+    }
+}
+
+// The exact scorer runs on gfx1100 (the PR's own card) when STRATA_SCORES_THREAD=1, and on gfx12 (RDNA4) unless STRATA_SCORES_THREAD=0:
+// there it is bitwise equal to the warp scorer on an R9700 (qsa_scores_gfx1100_parity --full, 35 cases; exact_pp residual dumps at 70K and
+// 131K tokens) and 3.6-4.4x faster in the scorer stage, +8% (131K) to +15% (230K) on a prompt read.  Other wave32 parts have no measurement.
+// Returns 0 (not offered), 1 (gfx1100: only on request), 2 (gfx12: the default).
+int scores_thread_arch() {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) { cudaGetLastError(); return 0; }
+    static thread_local int cached_device = -1;
+    static thread_local int arch = 0;
+    if (device != cached_device) {
+        cudaDeviceProp properties{};
+        arch = 0;
+        if (cudaGetDeviceProperties(&properties, device) == cudaSuccess)
+            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is(properties.gcnArchName, "gfx1100") ? 1 : 0;
+        cached_device = device;
+        cudaGetLastError();
+    }
+    return arch;
+}
+#endif
+
+#if !defined(__HIPCC__)
+// ---- prompt calls on cards without the tensor-core scorer (Turing): block_scores_kernel's scores, BITWISE, with a
+// thread per (query, head) instead of a warp per (query, block).  There a warp spends 20 shuffles and five 512-byte
+// loads per score; here a lane holds its query head (128 floats) in registers, every lane of the warp reads the same
+// key from shared memory (a broadcast), and the 4-value partials are added in the tree lane 0 of the xor-shuffle sum
+// computes: partial g covers values 4g..4g+3, level o adds g and g + o.  Float addition is commutative, so the same
+// pairs in the same tree give the same bits.  The heads are then summed 0..3 from 0.0f as there.  Blocks < n_bid only:
+// the tail block n_bid (the `dead` key, +1e9) is block_scores_tail_kernel's.
+constexpr int TS_Q = 64;     // queries per CTA (8 per warp, a lane per query head)
+constexpr int TS_KB = 32;    // key blocks per shared-memory tile
+constexpr int TS_BR = 512;   // key blocks per CTA
+
+__device__ __forceinline__ float ts_part(const float4 k4, const float4 q4) {
+    return k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;   // block_scores_kernel's per-lane expression
+}
+
+__global__ void __launch_bounds__(256, 1) block_scores_thread_kernel(const float* __restrict__ pooled,
+                                                                    const float* __restrict__ q_idx,
+                                                                    const int32_t* __restrict__ steps, int64_t nq,
+                                                                    int64_t max_blocks, int64_t reach,
+                                                                    float* __restrict__ out) {
+    __shared__ __align__(16) float4 ks[TS_KB][IDX_DIM / 4];
+    __shared__ float so[TS_Q][TS_KB + 1];
+    __shared__ int64_t s_nbid[TS_Q];
+    // Four lanes per query, lane j (0..3) one quarter of the tree for all four heads: the partials c[j] of lane 0's
+    // xor-shuffle sum combine groups j, j+16, j+8, j+24, j+4, j+20, j+12, j+28, and only then do the quarters meet
+    // (c0 + c2, c1 + c3, then their sum) - two shuffles here.  A key load now feeds four heads: four times fewer
+    // shared-memory loads per FMA (the kernel was bound by the MIO pipe, ncu: mio_throttle first).
+    constexpr int QG[8] = {0, 16, 8, 24, 4, 20, 12, 28};
+    const int t = threadIdx.x, lane = t & 31;
+    const int ql = (t >> 5) * 8 + (lane >> 2), j4 = lane & 3;   // this lane's query (in the CTA) and quarter
+    const int64_t q0 = (int64_t) blockIdx.y * TS_Q, qi = q0 + ql;
+    if (t < TS_Q) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : -1;
+    float4 qv[IDX_HEADS][8];
+    {
+        const float4* src = reinterpret_cast<const float4*>(q_idx + (qi < nq ? qi : 0) * IDX_HEADS * IDX_DIM);
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h)
+#pragma unroll
+            for (int m = 0; m < 8; ++m) qv[h][m] = src[h * (IDX_DIM / 4) + j4 + QG[m]];
+    }
+    __syncthreads();
+    int64_t top = -1;   // the largest n_bid of the CTA's queries: blocks at or past it are never written here
+    for (int i = 0; i < TS_Q; ++i) top = s_nbid[i] > top ? s_nbid[i] : top;
+    const int64_t b_lo = (int64_t) blockIdx.x * TS_BR;
+    int64_t b_hi = b_lo + TS_BR;
+    if (b_hi > reach) b_hi = reach;
+    if (b_hi > top) b_hi = top;
+    if (b_hi > max_blocks) b_hi = max_blocks;
+    for (int64_t b0 = b_lo; b0 < b_hi; b0 += TS_KB) {
+        const int nb = (int) (b_hi - b0 < TS_KB ? b_hi - b0 : TS_KB);
+        __syncthreads();   // the previous tile's reads of ks and so are done
+        for (int i = t; i < nb * (IDX_DIM / 4); i += blockDim.x)
+            ks[i / (IDX_DIM / 4)][i % (IDX_DIM / 4)] = reinterpret_cast<const float4*>(pooled + (b0 + i / (IDX_DIM / 4)) * IDX_DIM)[i % (IDX_DIM / 4)];
+        __syncthreads();
+        for (int j = 0; j < nb; ++j) {
+            float4 kk[8];
+#pragma unroll
+            for (int m = 0; m < 8; ++m) kk[m] = ks[j][j4 + QG[m]];
+            float e[IDX_HEADS];
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float c = ((ts_part(kk[0], qv[h][0]) + ts_part(kk[1], qv[h][1])) +
+                                 (ts_part(kk[2], qv[h][2]) + ts_part(kk[3], qv[h][3]))) +
+                                ((ts_part(kk[4], qv[h][4]) + ts_part(kk[5], qv[h][5])) +
+                                 (ts_part(kk[6], qv[h][6]) + ts_part(kk[7], qv[h][7])));
+                const float d = c + __shfl_xor_sync(0xffffffffu, c, 2);   // lane 0: c0 + c2, lane 1: c1 + c3
+                e[h] = d + __shfl_xor_sync(0xffffffffu, d, 1);           // lane 0: (c0 + c2) + (c1 + c3)
+            }
+            if (j4 == 0) {
+                float score = 0.0f;
+#pragma unroll
+                for (int h = 0; h < IDX_HEADS; ++h) score += e[h] > 0.0f ? e[h] : 0.0f;
+                so[ql][j] = score;
+            }
+        }
+        __syncthreads();
+        for (int i = t; i < TS_Q * nb; i += blockDim.x) {
+            const int q = i / nb, j = i % nb;
+            if (b0 + j < s_nbid[q]) out[(q0 + q) * max_blocks + b0 + j] = so[q][j];
+        }
+    }
+}
+#endif
 
 #if !defined(__HIPCC__)
 // ---- the decode top-k on a thread-block cluster (sm_90+; S19).  One CTA per query (block_topk_reg_kernel, or
@@ -1190,7 +1544,37 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
 #endif
 }
 #endif  // !__HIPCC__
+bool scores_multi_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+// STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
+bool scores_early_exit() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 }  // namespace
+
+bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
+                            const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
+                            void* stream) {
+    if (nq <= 0) return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
+        std::fprintf(stderr, "qsa_block_scores_slots: unsupported indexer geometry\n");
+        std::exit(1);
+    }
+    if (nq > MQ || !scores_multi_on()) return false;   // the single-query call would not run the multi kernel
+    ScoreSlotKeys keys{};
+    for (int64_t z = 0; z < nq; ++z) {
+        keys.pooled[z] = pooled[z];
+        keys.dead[z] = dead[z];
+    }
+    block_scores_slots_kernel<<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+        keys, q_idx, steps, max_blocks, scores, scores_early_exit());
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+}
 
 // block_scores_multi_kernel with the warp sums as one recursive-halving reduction.  A (query, head) dot is a lane's
 // 4-term product summed over the 32 lanes by an xor butterfly (offsets 16, 8, 4, 2, 1): 5 shuffles per value, 20 per
@@ -1289,6 +1673,24 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_halve_kernel(co
     }
 }
 
+// #1825: the prompt path's thread-per-head scorer (bitwise the warp kernel's scores).  Default: Turing with
+// STRATA_SM75_PERF=1 (the P100 gain measured here is +1..3% at 30-60K tokens, under the 3% bar for a new default);
+// STRATA_SCORES_THREAD=1 turns it on, =0 off, on any CUDA card
+bool scores_thread_on() {
+    static const int env = [] { const char* v = std::getenv("STRATA_SCORES_THREAD"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int ok[64] = {};   // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (ok[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+    }
+    return ok[dev] == 1;
+}
+
 bool scores_halve_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_SCORES_HALVE"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
@@ -1299,7 +1701,7 @@ bool scores_halve_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = major == 7 && minor == 5 ? 1 : 2;
+        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
     }
     return ok[dev] == 1;
 }
@@ -1312,8 +1714,10 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
-    static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
-    if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
+    if (scores_multi_on() && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
+        // QSAROWS: STRATA_QSA_ROWS=1 (exactly) takes block_scores_rows_kernel for calls of up to 4 queries - the same bits
+        static const bool rows_env = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+        if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
         if (scores_halve_on()) {   // Turing: block_scores_halve_kernel, the same bits
             const cudaStream_t st = (cudaStream_t) stream;
             if (nq <= 1) block_scores_halve_kernel<4><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
@@ -1333,20 +1737,88 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores halve: %s\n", cudaGetErrorString(e)); std::exit(1); }
             return;
         }
-        // STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
-        static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
         block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
-                                                                                     max_blocks, scores, early);
+                                                                                     max_blocks, scores, scores_early_exit());
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+#if defined(__HIPCC__)
+    // STRATA_SCORES_THREAD: 1 = on (gfx1100, gfx12), 0 = off, unset = on for gfx12 only (gfx1100: off, nothing measured here)
+    static const int thread_env = [] {
+        const char* value = std::getenv("STRATA_SCORES_THREAD");
+        return value == nullptr ? -1 : (std::atoi(value) == 1 ? 1 : 0);
+    }();
+    // The bound is the ACTUAL live extent. A reserved 256K context never enables this by itself.
+    if (thread_env != 0 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
+        (scores_thread_arch() == 2 || (thread_env == 1 && scores_thread_arch() == 1))) {
+        static thread_local bool logged = false;
+        if (!logged && (thread_env == -1 || std::getenv("STRATA_SCORES_THREAD_TRACE"))) {
+            std::fprintf(stderr, "qsa exact thread: the prompt's block scorer runs as the four-lanes-per-query kernel (nq=%lld active_blocks=%lld "
+                                 "capacity=%lld; the same scores bit for bit; STRATA_SCORES_THREAD=0 turns it off)\n",
+                         (long long)nq, (long long)active_blocks, (long long)max_blocks);
+            logged = true;
+        }
+        const dim3 tgrid((unsigned)((reach + TS_BR - 1) / TS_BR), (unsigned)((nq + TS_Q - 1) / TS_Q));
+        block_scores_thread_kernel<<<tgrid, 256, 0, (cudaStream_t)stream>>>(pooled, q_idx, steps, nq,
+                                                                         max_blocks, reach, scores);
+        block_scores_tail_kernel<<<(unsigned)nq, 32, 0, (cudaStream_t)stream>>>(dead, q_idx, steps,
+                                                                            max_blocks, scores);
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            std::fprintf(stderr, "qsa exact thread: %s\n", cudaGetErrorString(error));
+            std::exit(1);
+        }
+        return;
+    }
+#else
+    // prompt calls (an active-block count): the thread-per-head kernel, the same bits (opt-in: scores_thread_on); else the
+    // warp kernel below
+    if (active_blocks > 0 && scores_thread_on()) {
+        const dim3 tgrid((unsigned) ((reach + TS_BR - 1) / TS_BR), (unsigned) ((nq + TS_Q - 1) / TS_Q));
+        block_scores_thread_kernel<<<tgrid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach,
+                                                                             scores);
+        block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores thread: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        return;
+    }
+#endif
     const dim3 grid((unsigned) ((reach + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
     block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
                                                                               scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return true;
+    if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
+    cudaStream_t st = (cudaStream_t) stream;
+    const int n = (int) nq;
+    if (n == 1) block_scores_rows_kernel<1><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, n, max_blocks, scores);
+    else if (n == 2) block_scores_rows_kernel<2><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, n, max_blocks, scores);
+    else if (n == 3) block_scores_rows_kernel<3><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, n, max_blocks, scores);
+    else block_scores_rows_kernel<4><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, n, max_blocks, scores);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+}
+
+void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > MQ || rows.n != nq) {
+        std::fprintf(stderr, "qsa_block_scores_rows: unsupported geometry\n");
+        std::exit(1);
+    }
+    static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
+    block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
+                                                                                 max_blocks, scores, early, rows);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
@@ -1360,6 +1832,21 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         const char* v = std::getenv("STRATA_SELECT_WMMA");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
+    // any HIP card: the FP32 tiled scorer, opt-in as on CUDA (STRATA_SELECT_SIMT=1; another summation order than the
+    // warp kernel, so the default keeps the warp kernel).  RX 6900 XT, 256 queries at 128K: 2.71 -> 0.587 ms
+    static const bool simt_on = [] {
+        const char* v = std::getenv("STRATA_SELECT_SIMT");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (simt_on && !(wmma_on && sel_gfx12_device())) {
+        const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+        const bool rdna2 = sel_gfx103_device();
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "qsa select: FP32 tiled scorer (STRATA_SELECT_SIMT=1), tiles %s\n",
+                         rdna2 ? "32/128/16/8 (gfx103x)" : "32/64/32/4");
+        return block_scores_simt(pooled, dead, q_idx, steps, nq, max_blocks, reach, scores, (cudaStream_t) stream, rdna2);
+    }
     if (!wmma_on || !sel_gfx12_device()) return false;
     {
         const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
@@ -1410,17 +1897,14 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                     block_scores_simt2_kernel<64, 64><<<grid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq,
                                                                                               max_blocks, reach, scores);
                 }
-            } else {
-                const dim3 grid((unsigned) ((reach + SM_NB - 1) / SM_NB), (unsigned) ((nq + SM_QT - 1) / SM_QT));
-                if (grid.y > 65535) return false;
-                block_scores_simt_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks,
-                                                                                  reach, scores);
+                block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks,
+                                                                                        scores);
+                const cudaError_t e = cudaGetLastError();
+                if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores (simt): %s\n", cudaGetErrorString(e)); std::exit(1); }
+                return true;
             }
-            block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks,
-                                                                                    scores);
-            const cudaError_t e = cudaGetLastError();
-            if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores (simt): %s\n", cudaGetErrorString(e)); std::exit(1); }
-            return true;
+            return block_scores_simt(pooled, dead, q_idx, steps, nq, max_blocks, reach, scores, (cudaStream_t) stream,
+                                     false);
         }
     }
     static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several)
@@ -1769,7 +2253,7 @@ bool topk_split_device() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = (env == 1 || (major == 7 && minor == 5)) ? 1 : 2;
+        ok[dev] = (env == 1 || strata::sm75_default(major, minor)) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
     }
     return ok[dev] == 1;
 }
@@ -1989,9 +2473,22 @@ __global__ void __launch_bounds__(TK_T) block_topk_sample_kernel(const float* __
     }
 }
 
+// The prompt path's one-read top-k: STRATA_TOPK_SAMPLE=0 / 1 forces it off / on for any card; unset it is a Turing kernel
+// of the series (STRATA_SM75_PERF=1).  (As submitted in #2093 it was on for every CUDA card; same ids, but only measured
+// on an RTX 2080 Ti, so the other cards keep the wide kernel.)
 bool topk_sample_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_TOPK_SAMPLE"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
-    return env != 0;
+    if (env >= 0) return env != 0;
+    static int ok[64] = {};   // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (ok[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;
+    }
+    return ok[dev] == 1;
 }
 #endif
 
@@ -2040,9 +2537,15 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
 #if defined(__HIPCC__)
-    constexpr int64_t kRegMinBlocks = 7168;   // gfx1201: below ~28K cells the 1,024-thread kernel's fixed cost loses to the ref
+    // gfx1201: below ~28K cells (7,168 blocks) the 1,024-thread kernel's fixed cost loses to the ref.  STRATA_TOPK_REG_MIN_BLOCKS
+    // moves the line (0: the register kernel always); gfx1151's table sets 4096, the crossover with the cooperative scan
+    static const int64_t kRegMinBlocks = [] {
+        const char* v = std::getenv("STRATA_TOPK_REG_MIN_BLOCKS");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 7168;
+    }();
     const bool too_small = counted && reach < kRegMinBlocks;
-    if (old || too_small || reach > fit) {
+    // campaign3: `reach > fit` no longer forces the ref radix - the wide kernel below takes it (same ids).
+    if (old || too_small) {
 #else
     constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref
     const bool too_small = reach > fit && active_blocks > 0 && active_blocks < kWideMinBlocks;
@@ -2055,23 +2558,24 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-#if !defined(__HIPCC__)
     // Turing prefill (the `counted` bound) above ~90K cells (22,528 blocks): the wide kernel, which reads the keys
     // coalesced, instead of the register kernel's uncoalesced per-thread runs (PR #743: 131K, 1.03 -> 0.75 ms); the
     // same ids.  STRATA_TOPK_STREAM=0 restores the register kernel there.
+    // campaign3: on HIP too (was CUDA-only; gfx11 has no sm_90 cluster path and fell to the ref radix past the
+    // register kernel's reach - the deep-decode top-k cost).  Same ids as the ref kernel.
     static const bool turing_wide = [] {
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
     if (reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing's band
+#if !defined(__HIPCC__)
         if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
             block_topk_sample_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
             block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
-        } else {
-            block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
-        }
-    } else
+        } else
 #endif
+        block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    } else
     if (reach <= (int64_t) TK_T * TK_PER)
         block_topk_reg_kernel<TK_PER><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     else
