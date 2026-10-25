@@ -33,7 +33,7 @@ Bilder und arbeitet mit deinen Apps und Coding-Agents zusammen. Deine Chats und 
 - **Kostenlos.** MIT-Lizenz, kein Konto, keine Cloud.
 - **Privat.** Keine Telemetrie. Was Strata herunterlädt, wann es das Internet nutzt und wie es Downloads prüft, steht in [docs/SAFETY.md](docs/SAFETY.md).
 
-Version 0.2.1 · Engine 0.1.46
+Version 0.2.3 · Engine 0.1.48
 
 ## Was du brauchst
 
@@ -73,16 +73,16 @@ unsicher, welche du brauchst? Lies den Absatz unter der Tabelle.
 
 | System | Deine Grafikkarte | Datei zum Herunterladen |
 | --- | --- | --- |
-| **Windows 10 / 11** | NVIDIA RTX, Treiber 580 oder neuer | [`Strata-0.2.1-windows-cuda13.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-windows-cuda13.exe) |
-| | NVIDIA, ältere Karte oder Treiber älter als 580 | [`Strata-0.2.1-windows-cuda12.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-windows-cuda12.exe) |
-| | AMD Radeon RX 9000 Serie oder Radeon AI PRO R9700 | [`Strata-0.2.1-windows-hip.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-windows-hip.exe) |
-| | AMD Radeon RX 7000 Serie oder Ryzen AI Max (Strix Halo) | [`Strata-0.2.1-windows-hip-rdna3.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-windows-hip-rdna3.exe) |
-| **Linux** | NVIDIA RTX, Treiber 580 oder neuer | [`Strata-0.2.1-linux-nvidia-cuda13.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-linux-nvidia-cuda13.AppImage) |
-| | NVIDIA, ältere Karte oder Treiber älter als 580 | [`Strata-0.2.1-linux-nvidia-cuda12.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-linux-nvidia-cuda12.AppImage) |
-| | AMD Radeon RX 9000 Serie oder Radeon AI PRO R9700 | [`Strata-0.2.1-linux-amd-rx9070.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-linux-amd-rx9070.AppImage) |
-| | AMD Radeon RX 7000 Serie | [`Strata-0.2.1-linux-amd-rx7900.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-linux-amd-rx7900.AppImage) |
-| | AMD Ryzen AI Max (Strix Halo) | [`Strata-0.2.1-linux-amd-strixhalo.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-linux-amd-strixhalo.AppImage) |
-| **Mac** (Apple Silicon, macOS 15 oder neuer) | eingebaut | [`Strata-0.2.1-mac.dmg`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.1-mac.dmg) |
+| **Windows 10 / 11** | NVIDIA RTX, Treiber 580 oder neuer | [`Strata-0.2.3-windows-cuda13.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda13.exe) |
+| | NVIDIA, ältere Karte oder Treiber älter als 580 | [`Strata-0.2.3-windows-cuda12.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda12.exe) |
+| | AMD Radeon RX 9000 Serie oder Radeon AI PRO R9700 | [`Strata-0.2.3-windows-hip.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip.exe) |
+| | AMD Radeon RX 7000 Serie oder Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-windows-hip-rdna3.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip-rdna3.exe) |
+| **Linux** | NVIDIA RTX, Treiber 580 oder neuer | [`Strata-0.2.3-linux-nvidia-cuda13.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda13.AppImage) |
+| | NVIDIA, ältere Karte oder Treiber älter als 580 | [`Strata-0.2.3-linux-nvidia-cuda12.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda12.AppImage) |
+| | AMD Radeon RX 9000 Serie oder Radeon AI PRO R9700 | [`Strata-0.2.3-linux-amd-rx9070.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx9070.AppImage) |
+| | AMD Radeon RX 7000 Serie | [`Strata-0.2.3-linux-amd-rx7900.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx7900.AppImage) |
+| | AMD Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-linux-amd-strixhalo.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-strixhalo.AppImage) |
+| **Mac** (Apple Silicon, macOS 15 oder neuer) | eingebaut | [`Strata-0.2.3-mac.dmg`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-mac.dmg) |
 
 **Wenn du unsicher bist:** Bei NVIDIA nimmst du `cuda13`, wenn dein Treiber Version 580 oder neuer ist, sonst `cuda12`.
 `cuda12` ist für ältere Karten und ältere Treiber. Die Dateien `hip` und `amd` sind für AMD-Karten. Für andere AMD-Karten
@@ -108,7 +108,7 @@ Das Terminal ist der Befehl `strata`, gedacht für Skripte, Server und KI-Agents
 Linux und Mac:
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
 Windows (PowerShell):
@@ -162,9 +162,9 @@ Größen, mehr oder weniger stark komprimiert. Kleinere Größen sind schneller.
 | Größe | Benötigter Speicher (RAM + VRAM) | Download | Was es ist |
 | --- | ---: | ---: | --- |
 | **Gyro-S** | 27,6 GB | 58,5 GB | Für PCs, auf denen nichts anderes läuft. Die Qualität ist geringer als bei IQ2_XS. |
-| **Gyro-M** | 35 GB | 92,0 GB | Ungefähr die Qualität von IQ3_XXS bei etwa 20 % weniger GPU-Speicher. Es schreibt Antworten auf einer 12-GB-Karte und auf einer R9700 17-21 % langsamer als Q2_0. |
+| **Gyro-M** | 35 GB | 92,0 GB | Ungefähr die Qualität von IQ3_XXS bei etwa 20 % weniger GPU-Speicher. Es schreibt Antworten langsamer als Q2_0: 16 % auf einer RTX 3060 mit 12 GB, 21 % auf einer R9700. |
 
-Gyro läuft auf NVIDIA- und AMD-Karten (bei AMD experimentell), nicht auf Intel Arc und nicht auf dem Mac. Details und Messwerte:
+Gyro läuft auf NVIDIA- und AMD-Karten (bei AMD experimentell) auf Intel-Arc-Karten unter Linux (getestet auf einer Arc A750) und ab 0.2.2 auf Macs mit Apple Silicon (Gyro-S auf einem Mac mini mit 32 GB: 9 Tokens/s, die Experten werden von der SSD gelesen). Details und Messwerte:
 [docs/GYRO.md](docs/GYRO.md). Starte es mit `strata launch --model gyro-s`.
 
 ### Die anderen Größen
@@ -172,7 +172,7 @@ Gyro läuft auf NVIDIA- und AMD-Karten (bei AMD experimentell), nicht auf Intel 
 | Dein Speicher (RAM + VRAM) | Nimm | Hinweise |
 | --- | --- | --- |
 | **32 GB** | **Gyro-S**, oder den **[Coder](docs/MODELS.md#coder)** für Code | Der Coder braucht 32 GB RAM und behält die Hälfte der Experten, deshalb ist er außerhalb von Code schwächer |
-| **40 GB** | **[Swift 1.5](docs/MODELS.md#swift-15)** IQ2_XS (39,2 GB), oder **Gyro-M** (35 GB) | Swift denkt kürzer nach, bevor es antwortet. Gyro-M kommt der Qualität von IQ3_XXS nahe, schreibt Antworten aber 17-21 % langsamer als Q2_0 |
+| **40 GB** | **[Swift 1.5](docs/MODELS.md#swift-15)** IQ2_XS (39,2 GB), oder **Gyro-M** (35 GB) | Swift denkt kürzer nach, bevor es antwortet. Gyro-M kommt der Qualität von IQ3_XXS nahe, schreibt Antworten aber 16-21 % langsamer als Q2_0 |
 | **48 GB** | **IQ3_XXS** (47,0 GB) | Langsamer, besser |
 | **64 GB** | **IQ3_S** (54,8 GB), das Original oder Swift 1.5 | Am langsamsten, am besten. Es erreicht in den veröffentlichten Tests das volle Modell |
 | **96 GB oder mehr** | **UD-IQ4_XS** von Unsloth (etwa 72 GB RAM) bis **Q8_0** (etwa 136 GB), 4 bis 8 Bit | Näher am vollen Modell. Bei weniger RAM liest Strata einen Teil von der SSD, das ist viel langsamer |
@@ -189,6 +189,21 @@ Weitere Auswahl:
 - **[OrcaRouters Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** richtest du von Hand ein.
 
 Alle Größen, Downloads und was wo läuft: [docs/MODELS.md](docs/MODELS.md).
+
+### DeepSeek V4.1-Flash (im Terminal, ab 0.2.4)
+
+[DeepSeek V4.1-Flash](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) ist ein anderes, deutlich größeres Modell. ISTA-DASLab hat die drei Sets unten gebaut. Strata startet sie auf einem PC mit einer 12-GB-Grafikkarte und 46 bis 64 GB RAM und liest den Rest von der SSD. Es läuft auf NVIDIA-RTX-Karten der Serien 30 bis 50 und auf der Radeon AI PRO R9700. Es nutzt ein eigenes Engine-Paket, `strata-dsv41`, das `strata launch` lädt, wenn du DeepSeek wählst. Die Desktop-App bietet es noch nicht an.
+
+| Set | Download | Qualität im Vergleich zum Originalmodell | Antwortet mit |
+| --- | ---: | --- | --- |
+| **IQ1_M** (1,75 Bit) | 239 GB | KL 0,217, Perplexität 3,80 (+21 %); Code +8,9 %, Agent-Aufgaben +10,2 %; schwächer bei einfacher englischer Prosa. Laut Modellkarte von ISTA-DASLab behält es 98,7 % des Aufgabendurchschnitts des Basismodells (AIME25, GPQA-Diamond, LiveCodeBench v6). | noch nicht gemessen |
+| **IQ2_XXS** (2.00 Bit) | 257 GB | KL 0,170, Perplexität 3,63 (+15,5 %); Code +8,6 %, Agent-Aufgaben +5,3 % | etwa 8 bis 10 Tokens/s auf einer RTX 3060 (Code 9,9, Agent-Aufgaben 7,8), etwa 5 auf einer RTX 5070 |
+| **IQ2_XS** (2.25 Bit) | 274 GB | KL 0,107, Perplexität 3,37 (+7,3 %); Code +3,2 %, Agent-Aufgaben +2,2 % | etwa 11 Tokens/s auf einer Radeon AI PRO R9700 |
+| **IQ4_NL** (Engram-Tabelle, kein drittes Modell) | 111 GB, schon in allen drei Downloads oben enthalten | Die 4-Bit-Engram-Nachschlagetabelle, die das Modell aus RAM oder SSD liest. Alle drei Sets nutzen diese eine Datei (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`). | n/a |
+
+4x Radeon AI PRO R9700: etwa 31 Tokens/s, 55 bis 69 mit DSpark.
+
+Starte es mit `strata launch --model ist-das-2.00bpw` (oder `ist-das-1.75bpw`, `ist-das-2.25bpw`). Details, Geschwindigkeiten je Karte und die manuelle Installation: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
 
 ## Wie schnell ist es?
 
