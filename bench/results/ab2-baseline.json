@@ -1,0 +1,23 @@
+{
+  "label": "baseline",
+  "ts": "2026-10-13 00:27:55 UTC",
+  "decode_median_tok_s": 64.0,
+  "decode_all": [
+    61.7,
+    64.9,
+    63.5,
+    64.5
+  ],
+  "prefill_median_tok_s": 816.4,
+  "prefill_all": [
+    817.1,
+    815.7
+  ],
+  "mtp_acc": [
+    0.872,
+    0.867,
+    0.886,
+    0.894,
+    0.872
+  ]
+}

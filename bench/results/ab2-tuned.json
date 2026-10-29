@@ -1,0 +1,23 @@
+{
+  "label": "tuned",
+  "ts": "2026-10-13 00:34:42 UTC",
+  "decode_median_tok_s": 62.2,
+  "decode_all": [
+    51.0,
+    54.7,
+    69.8,
+    72.8
+  ],
+  "prefill_median_tok_s": 853.0,
+  "prefill_all": [
+    852.6,
+    853.3
+  ],
+  "mtp_acc": [
+    0.717,
+    0.717,
+    0.66,
+    0.848,
+    0.886
+  ]
+}

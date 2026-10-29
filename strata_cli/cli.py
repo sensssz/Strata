@@ -1040,7 +1040,7 @@ def _doctor(a: argparse.Namespace) -> int:
         if live_probe is not None:
             print(f"Live GPU probe: {live_probe['status']}")
             for card in live_probe["cards"]:
-                print(f"  GPU {card['index']}: {card['name']} | {card['memory_mib']} MiB | "
+                print(f"  GPU {card['index']}: {card['name']} | {str(card['memory_mib']) + ' MiB' if card['memory_mib'] is not None else 'unified memory'} | "
                       f"driver {card['driver_version']} | {card['uuid']}")
     return 0 if report["ok"] else 5
 
@@ -2132,7 +2132,7 @@ def _run(a: argparse.Namespace) -> int:
             return _components_backends(a)
         if a.command == "components" and a.components_command == "engine":
             return _components_engine(a)
-        if a.command == "update" or (a.command == "components" and a.components_command in ("update", "rollback")):
+        if a.command == "update" or (a.command == "components" and a.components_command in ("update", "rollback", "install-file")):
             from strata_cli import update_cmd
             return update_cmd.run(a)
         if a.command in ("doctor", "components"):
