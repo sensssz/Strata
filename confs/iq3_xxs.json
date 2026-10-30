@@ -50,7 +50,7 @@
     "--conversation-cache-mib",
     "8192",
     "--conversation-cache-slots",
-    "4",
+    "2",
     "--conversation-cache-min-free-mib",
     "2560",
     "--conversation-cache-min-tokens",
