@@ -62,6 +62,7 @@
     "STRATA_BF16_TC": "1",
     "STRATA_PA_V2T": "1",
     "STRATA_REFILL_PARTS": "1",
+    "STRATA_ROUTE_PRIOR": "1.5",
     "STRATA_SELECT_SIMT": "2"
   },
   "exe": "/home/sens/Strata/engine/strata",
