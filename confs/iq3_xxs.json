@@ -60,6 +60,7 @@
   "env": {
     "STRATA_ADAPT_OVERLAP": "1",
     "STRATA_BF16_TC": "1",
+    "STRATA_DEFAULTS": "026",
     "STRATA_PA_V2T": "1",
     "STRATA_REFILL_PARTS": "1",
     "STRATA_ROUTE_PRIOR": "1.5",
