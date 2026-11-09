@@ -64,7 +64,7 @@ bool MtpDrafter::load_experts_host(const std::string& rt_dir, const ModelGeometr
         off += n;
     }
     experts_ = nullptr;
-    experts_resident_ = false;   // until attach_experts
+    experts_lent_ = true;   // until attach_experts: the device block has no experts yet (see experts_resident())
     std::fprintf(stderr, "strata mtp: --mtp-lend: the %lld experts (%.0f MiB) wait in pinned RAM for the expert cache's "
                          "tail\n", (long long) g.n_expert, (double) bytes / 1048576.0);
     return true;
@@ -94,7 +94,7 @@ bool MtpDrafter::attach_experts(uint8_t* dev, std::string& err) {
     // read back once: a block that is right about its address and wrong about its bytes drafts plausible tokens that
     // the verify window then rejects - slower, never wrong, and so easy to miss (expert_cache.hpp: verify_slot)
     if (!mtp_lend_compare(experts_, h_experts_, bytes, err)) return false;
-    experts_resident_ = true;
+    experts_lent_ = false;   // the block holds the experts again (shared accessor experts_resident())
     if (!experts_borrowed_) {   // nothing to lend: the host copy has no use
         cudaFreeHost(h_experts_);
         h_experts_ = nullptr;
@@ -104,19 +104,19 @@ bool MtpDrafter::attach_experts(uint8_t* dev, std::string& err) {
 }
 
 bool MtpDrafter::lend_experts(std::string& err) {
-    if (!experts_borrowed_ || !experts_resident_) return true;
+    if (!experts_borrowed_ || experts_lent_) return true;
     if (chain_live_) { err = "mtp: --mtp-lend: a pipelined chain is still in flight"; return false; }
     const OnDevice on_device(device_);
     if ((cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) || (side_ && cudaStreamSynchronize(side_) != cudaSuccess)) {
         err = "mtp: its stream failed";
         return false;
     }
-    experts_resident_ = false;
+    experts_lent_ = true;   // the prompt path may now stage over the block
     return true;
 }
 
 bool MtpDrafter::restore_experts(std::string& err) {
-    if (!experts_borrowed_ || experts_resident_) return true;
+    if (!experts_borrowed_ || !experts_lent_) return true;
     const OnDevice on_device(device_);
     const uint64_t bytes = expert_bytes();
     // blocking, from pinned RAM: the prompt path's stream has finished with the region (its part ended with a sync)
@@ -125,7 +125,7 @@ bool MtpDrafter::restore_experts(std::string& err) {
         return false;
     }
     if (mtp_lend_verify_env() && !mtp_lend_compare(experts_, h_experts_, bytes, err)) return false;
-    experts_resident_ = true;
+    experts_lent_ = false;   // the experts are back in the block
     return true;
 }
 
