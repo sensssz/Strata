@@ -37,8 +37,6 @@
     "8192",
     "--lookup-chain",
     "3",
-    "--lookup-max-t",
-    "12",
     "--expert-profile-save",
     "expert-profile-learned.bin",
     "--spec-min-p",
@@ -66,7 +64,8 @@
     "STRATA_PA_V2T": "1",
     "STRATA_REFILL_PARTS": "1",
     "STRATA_ROUTE_PRIOR": "1.5",
-    "STRATA_SELECT_SIMT": "2"
+    "STRATA_SELECT_SIMT": "2",
+    "STRATA_EXCHANGE_ROTATE": "1"
   },
   "exe": "/home/sens/Strata/engine/strata",
   "fit_max_tokens": true,
