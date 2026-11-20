@@ -85,5 +85,7 @@
     "mmproj": "/home/sens/Strata-data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
     "model": "/home/sens/Strata-data/models/abliterated-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
     "threads": 4
-  }
+  },
+  "reasoning_effort": "medium",
+  "effort_position": "end"
 }
